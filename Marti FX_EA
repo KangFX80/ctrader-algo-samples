@@ -1,0 +1,150 @@
+using System;
+using System.Linq;
+using cAlgo.API;
+using cAlgo.API.Indicators;
+using cAlgo.API.Internals;
+
+namespace cAlgo.Robots
+{
+    [Robot(TimeZone = TimeZones.UTC, AccessRights = AccessRights.None)]
+    public class MartiFXcBot : Robot
+    {
+        //--- Input Parameters
+        [Parameter("EA Name", DefaultValue = "Marti FX")] public string EAName { get; set; }
+        [Parameter("Initial Lot", DefaultValue = 0.01)] public double InitialLot { get; set; }
+        [Parameter("Take Profit (points)", DefaultValue = 200)] public int TakeProfit { get; set; }
+        [Parameter("Distance (points)", DefaultValue = 200)] public int Distance { get; set; }
+        [Parameter("Lot Multiplier", DefaultValue = 1.5)] public double Multiplier { get; set; }
+        [Parameter("Max Positions", DefaultValue = 10)] public int MaxPositions { get; set; }
+        [Parameter("Profit Target (%)", DefaultValue = 10.0)] public double ProfitTargetPct { get; set; }
+
+        //--- Indicator Parameters
+        [Parameter("Stoch K", DefaultValue = 14)] public int StochK { get; set; }
+        [Parameter("Stoch D", DefaultValue = 3)] public int StochD { get; set; }
+        [Parameter("RSI Period", DefaultValue = 14)] public int RSIPeriod { get; set; }
+        [Parameter("CCI Period", DefaultValue = 14)] public int CCIPeriod { get; set; }
+        [Parameter("MACD Fast", DefaultValue = 12)] public int MACDFast { get; set; }
+        [Parameter("MACD Slow", DefaultValue = 26)] public int MACDSlow { get; set; }
+        [Parameter("MACD Signal", DefaultValue = 9)] public int MACDSignal { get; set; }
+        [Parameter("ADX Period", DefaultValue = 14)] public int ADXPeriod { get; set; }
+
+        //--- Internal
+        private double _initialBalance;
+        private StochasticOscillator _stoch;
+        private RelativeStrengthIndex _rsi;
+        private CommodityChannelIndex _cci;
+        private MacdHistogram _macd;
+        private AverageDirectionalMovementIndex _adx;
+
+        protected override void OnStart()
+        {
+            _initialBalance = Account.Balance;
+
+            _stoch = Indicators.StochasticOscillator(Bars.ClosePrices, StochK, StochD, StochD, MovingAverageType.Simple);
+            _rsi = Indicators.RelativeStrengthIndex(Bars.ClosePrices, RSIPeriod);
+            _cci = Indicators.CommodityChannelIndex(Bars.ClosePrices, CCIPeriod);
+            _macd = Indicators.MacdHistogram(Bars.ClosePrices, MACDFast, MACDSlow, MACDSignal);
+            _adx = Indicators.AverageDirectionalMovementIndex(Bars.HighPrices, Bars.LowPrices, Bars.ClosePrices, ADXPeriod);
+        }
+
+        protected override void OnBar()
+        {
+            // Check profit target
+            var profit = Account.Equity - _initialBalance;
+            if (profit >= _initialBalance * (ProfitTargetPct / 100.0))
+            {
+                CloseAllPositions();
+                return;
+            }
+
+            // Generate signal
+            var signal = GenerateSignal();
+            if (signal == TradeType.Buy)
+                ManageBuy();
+            else if (signal == TradeType.Sell)
+                ManageSell();
+        }
+
+        private TradeType? GenerateSignal()
+        {
+            int buyCount = 0, sellCount = 0;
+            TimeFrame[] tfs = { TimeFrame.Minute5, TimeFrame.Minute15, TimeFrame.Minute30, TimeFrame.Hour, TimeFrame.Hour4, TimeFrame.Daily };
+            foreach (var tf in tfs)
+            {
+                var idx = MarketSeries.GetIndexByTime(Server.Time, tf);
+                if (idx < 1) continue;
+
+                // fetch indicators on timeframe
+                var k = Indicators.StochasticOscillator(MarketData.GetSeries(SymbolName, tf).Close, StochK, StochD, StochD, MovingAverageType.Simple).PercentK.LastValue;
+                var d = Indicators.StochasticOscillator(MarketData.GetSeries(SymbolName, tf).Close, StochK, StochD, StochD, MovingAverageType.Simple).PercentD.LastValue;
+                var rsiVal = Indicators.RelativeStrengthIndex(MarketData.GetSeries(SymbolName, tf).Close, RSIPeriod).Result.LastValue;
+                var cciVal = Indicators.CommodityChannelIndex(MarketData.GetSeries(SymbolName, tf).Close, CCIPeriod).Result.LastValue;
+                var ma20 = Indicators.SimpleMovingAverage(MarketData.GetSeries(SymbolName, tf).Close, 20).Result.LastValue;
+                var ma50 = Indicators.SimpleMovingAverage(MarketData.GetSeries(SymbolName, tf).Close, 50).Result.LastValue;
+                var macdMain = Indicators.MacdHistogram(MarketData.GetSeries(SymbolName, tf).Close, MACDFast, MACDSlow, MACDSignal).Signal.LastValue;
+                var macdSig = Indicators.MacdHistogram(MarketData.GetSeries(SymbolName, tf).Close, MACDFast, MACDSlow, MACDSignal).Histogram.LastValue;
+                var adxVal = Indicators.AverageDirectionalMovementIndex(MarketData.GetSeries(SymbolName, tf).High, MarketData.GetSeries(SymbolName, tf).Low, MarketData.GetSeries(SymbolName, tf).Close, ADXPeriod).ADX.LastValue;
+                var pDI = Indicators.AverageDirectionalMovementIndex(MarketData.GetSeries(SymbolName, tf).High, MarketData.GetSeries(SymbolName, tf).Low, MarketData.GetSeries(SymbolName, tf).Close, ADXPeriod).PosDI.LastValue;
+                var mDI = Indicators.AverageDirectionalMovementIndex(MarketData.GetSeries(SymbolName, tf).High, MarketData.GetSeries(SymbolName, tf).Low, MarketData.GetSeries(SymbolName, tf).Close, ADXPeriod).NegDI.LastValue;
+
+                int score = 0;
+                score += k > d ? 2 : -2;
+                score += rsiVal > 50 ? 1 : -1;
+                score += cciVal > 100 ? 2 : cciVal < -100 ? -2 : 0;
+                score += ma20 > ma50 ? 1 : -1;
+                score += macdMain > macdSig ? 1 : -1;
+                if (adxVal > 25)
+                    score += pDI > mDI ? 2 : -2;
+
+                if (score > 3) buyCount++;
+                else if (score < -3) sellCount++;
+            }
+
+            if (buyCount > sellCount) return TradeType.Buy;
+            if (sellCount > buyCount) return TradeType.Sell;
+            return null;
+        }
+
+        private void ManageBuy()
+        {
+            var buys = Positions.Where(p => p.Label == EAName && p.SymbolName == SymbolName && p.TradeType == TradeType.Buy).ToList();
+            if (!buys.Any())
+            {
+                ExecuteMarketOrder(TradeType.Buy, SymbolName, Symbol.QuantityToVolumeInUnits(InitialLot), EAName, null, Symbol.PipSize*TakeProfit);
+            }
+            else
+            {
+                var last = buys.Last();
+                if (Symbol.Bid <= last.EntryPrice - Distance*Symbol.PipSize && buys.Count < MaxPositions)
+                {
+                    var newLot = last.VolumeInUnits * Multiplier;
+                    ExecuteMarketOrder(TradeType.Buy, SymbolName, newLot, EAName, null, Symbol.PipSize*TakeProfit);
+                }
+            }
+        }
+
+        private void ManageSell()
+        {
+            var sells = Positions.Where(p => p.Label == EAName && p.SymbolName == SymbolName && p.TradeType == TradeType.Sell).ToList();
+            if (!sells.Any())
+            {
+                ExecuteMarketOrder(TradeType.Sell, SymbolName, Symbol.QuantityToVolumeInUnits(InitialLot), EAName, null, Symbol.PipSize*TakeProfit);
+            }
+            else
+            {
+                var last = sells.Last();
+                if (Symbol.Ask >= last.EntryPrice + Distance*Symbol.PipSize && sells.Count < MaxPositions)
+                {
+                    var newLot = last.VolumeInUnits * Multiplier;
+                    ExecuteMarketOrder(TradeType.Sell, SymbolName, newLot, EAName, null, Symbol.PipSize*TakeProfit);
+                }
+            }
+        }
+
+        private void CloseAllPositions()
+        {
+            foreach (var position in Positions.Where(p => p.Label == EAName && p.SymbolName == SymbolName))
+                ClosePosition(position);
+        }
+    }
+}
